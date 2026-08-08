@@ -5,13 +5,105 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import urllib.request
+import uuid
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-WHISPER_CLI = "/Users/tomvan/projects/whisper.cpp/build/bin/whisper-cli"
-WHISPER_MODEL = "/Users/tomvan/projects/whisper.cpp/models/ggml-base.en.bin"
+# Paths derive from the running user's home so the same file is correct on
+# both hosts (M1 dev: /Users/tomvan, M4 prod: /Users/tomtomxyz). Before
+# picklOS#444 the two copies diverged only in these hardcoded prefixes.
+HOME = os.path.expanduser("~")
+WHISPER_CLI = os.path.join(HOME, "projects/whisper.cpp/build/bin/whisper-cli")
+WHISPER_MODEL = os.path.join(HOME, "projects/whisper.cpp/models/ggml-base.en.bin")
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 PORT = 8178
+
+# picklOS#444 persistent-engine adapter. When WHISPER_ENGINE_URL is set
+# (e.g. http://127.0.0.1:8380/inference — the com.vi.whisper-engine
+# whisper-server), the ffmpeg-normalized WAV is POSTed there instead of
+# spawning whisper-cli per request. Unset -> behavior identical to before.
+ENGINE_TIMEOUT = 20  # seconds; on expiry we fall back to the spawn path
+
+
+def _log_fallback(reason):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(
+        f"[{ts}] ENGINE FALLBACK -> whisper-cli spawn path: {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _transcribe_via_engine(wav_path, engine_url):
+    """POST the normalized WAV to the persistent whisper-server engine.
+
+    S419 spike nondeterminism note: a persistent whisper-server reusing one
+    whisper_state across whisper_full calls can occasionally flip a marginal
+    word on identical input bytes (2-3/10 on near-tie clips); a fresh-boot
+    server is deterministic (4/4). Falsified as ffmpeg / Metal / temp-fallback
+    RNG / params — hypothesis points at reused whisper_state upstream. Not a
+    blocker for voice chat (real-mic floor is higher), but an upstream-issue
+    search is still owed before/at cutover (picklOS#444).
+
+    The engine's boot flags (-bs 5 -bo 5 -nt) match prod whisper-cli; we send
+    ONLY the `file` field so no per-request form field overrides them.
+    """
+    with open(wav_path, "rb") as f:
+        wav_bytes = f.read()
+    boundary = uuid.uuid4().hex
+    body = (
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode()
+        + wav_bytes
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+    req = urllib.request.Request(
+        engine_url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=ENGINE_TIMEOUT) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"engine HTTP {resp.status}")
+        payload = json.loads(resp.read().decode("utf-8"))
+    text = payload["text"]  # missing key -> KeyError -> fallback
+    if not isinstance(text, str):
+        raise RuntimeError("engine JSON 'text' is not a string")
+    # Contract delta 3 (S419 spike): engine text carries a leading space +
+    # trailing newline(s) that stripped whisper-cli stdout does not. .strip()
+    # is the exact treatment the spawn path applies to cli stdout, so response
+    # bytes stay byte-compatible with today whenever the text matches.
+    return text.strip()
+
+
+def _transcribe_via_cli(wav_path):
+    """The pre-#444 per-request spawn path — byte-identical known-good arm."""
+    result = subprocess.run(
+        [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", wav_path, "--no-timestamps", "-nt"],
+        capture_output=True, timeout=30,
+    )
+    return result.stdout.decode().strip()
+
+
+def transcribe(wav_path):
+    """Engine if configured; ANY engine failure (connection refused, timeout,
+    non-200, unparseable JSON) falls back to the spawn path with one loud
+    ISO-stamped log line. The fallback IS the rollback: production keeps
+    working per-request if the engine dies."""
+    engine_url = os.environ.get("WHISPER_ENGINE_URL")
+    if engine_url:
+        try:
+            return _transcribe_via_engine(wav_path, engine_url)
+        except Exception as e:
+            _log_fallback(f"{type(e).__name__}: {e}")
+    return _transcribe_via_cli(wav_path)
 
 
 class TranscribeHandler(BaseHTTPRequestHandler):
@@ -71,13 +163,9 @@ class TranscribeHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"ffmpeg error: {conv.stderr.decode()[:200]}")
                 return
 
-            # Transcribe with whisper-cli
-            result = subprocess.run(
-                [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", wav_path, "--no-timestamps", "-nt"],
-                capture_output=True, timeout=30,
-            )
-
-            text = result.stdout.decode().strip()
+            # Transcribe: persistent engine when WHISPER_ENGINE_URL is set,
+            # else the original whisper-cli spawn (picklOS#444)
+            text = transcribe(wav_path)
 
             # Clean up
             os.unlink(input_path)
