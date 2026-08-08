@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- DRAFT — NOT INSTALLED (picklOS#444). Persistent whisper-server STT
+         engine on loopback :8380, consumed by server-wrapper.py (:8178) when
+         WHISPER_ENGINE_URL is set. Deploy per DEPLOY.md, behind the
+         infrastructure-change gate, supervised daytime cutover only.
+
+         Flags mirror prod whisper-cli parity (S419 spike trap 1): the server's
+         own defaults are greedy (beam -1, best-of 2) and WOULD regress WER
+         3.11% vs 1.34% — hence -bs 5 -bo 5 -nt. No --convert: the wrapper
+         already ffmpeg-normalizes to 16kHz mono WAV before POSTing.
+         Model file is the SAME one the wrapper's spawn path uses. -->
+    <key>Label</key>
+    <string>com.vi.whisper-engine</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>/Users/tomtomxyz/projects/whisper.cpp/build/bin/whisper-server -m /Users/tomtomxyz/projects/whisper.cpp/models/ggml-base.en.bin --host 127.0.0.1 --port 8380 -bs 5 -bo 5 -nt 2&gt;&amp;1 | while IFS= read -r line; do echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $line"; done</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/tomtomxyz/projects/whisper.cpp</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tomtomxyz/.local/log/whisper-engine.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/tomtomxyz/.local/log/whisper-engine.log</string>
+</dict>
+</plist>
